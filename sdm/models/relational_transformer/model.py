@@ -73,11 +73,10 @@ class RelationalTransformer(ICLModel):
     recipe, datetimes are standardized over the context, and text values and
     column descriptions are embedded with ``all-MiniLM-L12-v2``. The target
     cells of query rows are masked, while context rows keep theirs as
-    in-context examples. Twelve relational attention blocks
-    (:class:`~sdm.models.relational_transformer.block.RelationalBlock`)
-    attend along columns, within rows and their foreign-key parent rows, and
-    from rows to the rows that reference them, before a linear head reads the
-    masked cells out.
+    in-context examples. Twelve relational attention blocks attend along
+    columns, within rows and their foreign-key parent rows, and from rows to
+    the rows that reference them, before a linear head reads the masked cells
+    out.
 
     Related tables are read as foreign keys from the left to the right table
     of each :class:`~sdm.Relationship`, and task links attach task rows to
