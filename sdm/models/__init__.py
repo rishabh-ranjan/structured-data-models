@@ -9,6 +9,7 @@ __lazy_modules__ = {
     "sdm.models.kumo",
     "sdm.models.chronos2",
     "sdm.models.timesfm3",
+    "sdm.models.relational_transformer",
 }
 
 from sdm.models.base import Callback, Model, ICLModel, ECOC
@@ -22,6 +23,7 @@ from sdm.models.kumo import (
 )
 from sdm.models.chronos2 import Chronos2
 from sdm.models.timesfm3 import TimesFM3
+from sdm.models.relational_transformer import RelationalTransformer
 
 
 __all__ = [
@@ -37,4 +39,5 @@ __all__ = [
     "KumoAnomaly",
     "Chronos2",
     "TimesFM3",
+    "RelationalTransformer",
 ]

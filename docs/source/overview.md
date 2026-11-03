@@ -8,7 +8,7 @@ A foundation model in this domain needs more than the neural network itself: typ
 `structured-data-models` keeps these concerns explicit while moving the full modeling workflow into GPU-accelerated PyTorch.
 In particular, this library provides:
 
-- [**Models**](icl): Reference implementations of structured data foundation models, including tabular models ({py:class}`~sdm.models.TabICLv2`, {py:class}`~sdm.models.KumoTabular`, *etc*), relational models ({py:class}`~sdm.models.KumoRelational`), and time series models ({py:class}`~sdm.models.Chronos2`, {py:class}`~sdm.models.KumoForecast`, {py:class}`~sdm.models.TimesFM3`, {py:class}`~sdm.models.KumoAnomaly`, *etc*), built on a unified interface with room for future model families.
+- [**Models**](icl): Reference implementations of structured data foundation models, including tabular models ({py:class}`~sdm.models.TabICLv2`, {py:class}`~sdm.models.KumoTabular`, *etc*), relational models ({py:class}`~sdm.models.KumoRelational`, {py:class}`~sdm.models.RelationalTransformer`), and time series models ({py:class}`~sdm.models.Chronos2`, {py:class}`~sdm.models.KumoForecast`, {py:class}`~sdm.models.TimesFM3`, {py:class}`~sdm.models.KumoAnomaly`, *etc*), built on a unified interface with room for future model families.
 - [**Tensor semantics**](tensor): PyTorch-compatible tensor types for numerical, categorical, datetime, text, and relational data.
 - [**Data processing**](processing): Composable, extensible, and GPU-accelerated preprocessing and postprocessing for structured data workflows.
 

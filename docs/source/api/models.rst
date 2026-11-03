@@ -37,6 +37,12 @@ Overview
      - 29.93M–30.94M
      - `Apache-2.0 <https://github.com/NVIDIA/structured-data-models/blob/main/LICENSE>`__
      - `OpenMDW-1.1, with BSD-3-Clause notice <https://huggingface.co/nvidia/Kumo-Relational>`__
+   * - | :class:`~sdm.models.RelationalTransformer`
+       | (`Paper <https://arxiv.org/abs/2610.17867>`__)
+     - 2026-09-14
+     - 85.56M
+     - `Apache-2.0 <https://github.com/stanford-star/relational-transformer/blob/main/LICENSE>`__
+     - `Apache-2.0 <https://huggingface.co/stanford-star/rt-j>`__
    * - | :class:`~sdm.models.KumoForecast`
        | (`Paper <https://ieeexplore.ieee.org/abstract/document/11402442>`__)
      - 2025-05-06

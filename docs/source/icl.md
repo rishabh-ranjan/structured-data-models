@@ -268,6 +268,7 @@ out = model.predict(x_query, related_query_tables)
 
 The {py:attr}`~sdm.models.ICLModel.supports_related_tables` attribute denotes whether an {py:class}`~sdm.models.ICLModel` supports relational context.
 For example, {py:class}`~sdm.models.KumoRelational` consumes the `x_context` and `x_query` together with related tables, propagates information through its induced relational subgraph, and then predicts the query rows from the labeled context rows.
+{py:class}`~sdm.models.RelationalTransformer` instead tokenizes every cell of the task rows and related tables, and predicts the masked target cells of the query rows with attention along columns, rows, and foreign keys.
 
 To simplify the construction of {py:class}`~sdm.relational.RelatedTables`, we provide heterogeneous, temporally aware subgraph samplers with CPU and CUDA backends, based on [`pyg-lib`](https://github.com/pyg-team/pyg-lib) and [`cugraph`](https://docs.rapids.ai/api/cugraph), respectively.
 Given rows from `x_context` or `x_query`, a sampler returns the reachable subset of related table rows up to a user-specified number of hops and neighbors.

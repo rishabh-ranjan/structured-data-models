@@ -62,6 +62,16 @@ Its weights are not bundled with this project and may be downloaded only after t
 
 The [`sdm/models/timestral/`](sdm/models/timestral/) implementation contain code derived from [`Timestral`](https://github.com/mistralai/timestral).
 
+## Relational Transformer
+
+- Source: https://github.com/stanford-star/relational-transformer
+- License: Apache License 2.0
+- License terms: [`sdm/models/relational_transformer/LICENSE`](sdm/models/relational_transformer/LICENSE)
+- Optional pretrained weights: https://huggingface.co/stanford-star/rt-j and https://huggingface.co/stanford-star/rt-plurel
+- Weights license: Apache License 2.0
+
+The [`sdm/models/relational_transformer/`](sdm/models/relational_transformer/) implementation contains code derived from [`Relational Transformer`](https://github.com/stanford-star/relational-transformer).
+
 ## DPM-Solver
 
 - Source: https://github.com/LuChengTHU/dpm-solver
