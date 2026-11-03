@@ -21,6 +21,7 @@ from sdm.models.relational_transformer import model as rt_module
 from sdm.models.relational_transformer.block import (
     AttentionMask,
     RelationalBlock,
+    _block_mask,
     attention_masks,
 )
 from sdm.models.relational_transformer.cells import (
@@ -655,3 +656,35 @@ def test_block_sparse_attention_matches_dense() -> None:
         dense = core(cells, block_sparse=False)
         sparse = core(cells, block_sparse=True)
     torch.testing.assert_close(sparse, dense, atol=1e-4, rtol=1e-3)
+
+
+@pytest.mark.parametrize("size", [5, 128, 300])
+def test_block_mask_matches_torch(size: int) -> None:
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    generator = torch.Generator().manual_seed(0)
+    mask = torch.rand(2, size, size, generator=generator) < 0.3
+    mask[:, : size // 2, : size // 2] = True
+    mask[1, size // 2 :, : size // 2] = False
+
+    def mask_mod(
+        b: torch.Tensor,
+        h: torch.Tensor,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+    ) -> torch.Tensor:
+        return mask[b, q, kv]
+
+    expected = create_block_mask(
+        mask_mod, B=2, H=None, Q_LEN=size, KV_LEN=size, device="cpu"
+    )
+    block_mask = _block_mask(mask)
+    for name in (
+        "kv_num_blocks",
+        "kv_indices",
+        "full_kv_num_blocks",
+        "full_kv_indices",
+    ):
+        assert getattr(block_mask, name).equal(getattr(expected, name)), name
+    assert block_mask.seq_lengths == expected.seq_lengths
+    assert block_mask.to_dense().equal(expected.to_dense())

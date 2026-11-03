@@ -17,11 +17,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 from torch.nn import Linear, ModuleDict
-from torch.nn.attention.flex_attention import (
-    BlockMask,
-    create_block_mask,
-    flex_attention,
-)
+from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
 from sdm.nn import LogScale, RMSNorm, SwiGLU
 
@@ -89,19 +85,34 @@ def attention_masks(
     }
 
 
-def _block_mask(mask: Tensor) -> BlockMask:  # [B, S, S]
+def _block_mask(mask: Tensor, block_size: int = 128) -> BlockMask:  # [B, S, S]
+    # Read the block layout off the materialized mask, as a compiled
+    # `create_block_mask` would, without a compilation per sequence length.
+    B, S, _ = mask.size()
+    num_blocks = -(-S // block_size)
+    padding = num_blocks * block_size - S
+    blocks = F.pad(mask, (0, padding, 0, padding))
+    blocks = blocks.view(B, num_blocks, block_size, num_blocks, block_size)
+    count = blocks.sum(dim=(2, 4))  # [B, Q_blocks, KV_blocks]
+    full = count == block_size * block_size
+    partial = (count > 0) & ~full
+
+    def ordered(blocks: Tensor) -> tuple[Tensor, Tensor]:
+        blocks = blocks.to(torch.int32).unsqueeze(
+            1
+        )  # [B, 1, Q_blocks, KV_blocks]
+        indices = blocks.argsort(dim=-1, descending=True, stable=True)
+        return blocks.sum(dim=-1), indices.to(torch.int32)
+
     def mask_mod(b: Tensor, h: Tensor, q: Tensor, kv: Tensor) -> Tensor:
         return mask[b, q, kv]
 
-    # The dense mask is already materialized, so the block layout is read off
-    # it directly instead of compiling the mask function per shape.
-    return create_block_mask(
-        mask_mod,
-        B=mask.size(0),
-        H=None,
-        Q_LEN=mask.size(1),
-        KV_LEN=mask.size(2),
-        device=mask.device,
+    return BlockMask.from_kv_blocks(
+        *ordered(partial),
+        *ordered(full),
+        BLOCK_SIZE=block_size,
+        mask_mod=mask_mod,
+        seq_lengths=(S, S),
     )
 
 
