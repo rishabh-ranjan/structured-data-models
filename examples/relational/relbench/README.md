@@ -1,14 +1,16 @@
-# Kumo Relational on RelBench
+# Relational Foundation Models on RelBench
 
-This example evaluates `KumoRelational` on [RelBench](https://relbench.stanford.edu).
+These examples evaluate `KumoRelational` and `RelationalTransformer` on [RelBench](https://relbench.stanford.edu).
 
-## Run
+## Kumo Relational
+
+### Run
 
 ```bash
 python main.py --dataset=rel-f1 --task=driver-dnf
 ```
 
-## Options
+### Options
 
 - `--num_estimators`: Number of estimators (default: `1`).
 - `--context_size`: Maximum number of context rows (default: `10_000`).
@@ -17,7 +19,7 @@ python main.py --dataset=rel-f1 --task=driver-dnf
 - `--num_lags`: The number of lag targets to use as additional input (default: `20`).
 - `--text_dim`: Text embedding dimension after PCA for the entity table (default: `0`).
 
-## Results
+### Results
 
 Optimal hyperparameters found via the [RelArena-α](../../../benchmark/relational/relarena) evaluation protocol, using 8 estimators and 20 lag targets:
 
@@ -47,6 +49,24 @@ Optimal hyperparameters found via the [RelArena-α](../../../benchmark/relationa
 | `rel-stack`  | `post-votes`      |    11.36 |     12.49 | `20K` | `rnd`  |       `[]` |      `0` |            |
 | `rel-trial`  | `study-adverse`   |    10.21 |      9.42 | `20K` | `last` |       `[]` |     `32` | `mini`[^1] |
 | `rel-trial`  | `site-success`    |    87.90 |     84.31 | `10K` | `last` |   `[8, 8]` |     `32` | `mini`[^1] |
+
+## Relational Transformer
+
+### Run
+
+```bash
+python relational_transformer.py --dataset=rel-f1 --task=driver-dnf
+```
+
+### Options
+
+- `--context_size`: Number of labeled context rows shared by all queries (default: `32`).
+- `--context_mode`: Context selection strategy, either `last` or `rnd` (default: `last`).
+- `--num_neighbors`: The number of neighbors to sample for each hop (default: `[8, 8]`).
+- `--batch_size`: Number of query rows predicted together (default: `16`).
+- `--num_lags`: The number of lag targets to use as additional input (default: `0`).
+
+Attention is dense over all cells of the context and query rows, so the context size, the number of neighbors, and the batch size together bound the number of cells per forward pass; the released checkpoint was pretrained with up to 8,192 cells.
 
 [^1]: `sentence-transformers/all-MiniLM-L6-v2`
 
