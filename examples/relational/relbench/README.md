@@ -60,13 +60,23 @@ python relational_transformer.py --dataset=rel-f1 --task=driver-dnf
 
 ### Options
 
-- `--context_size`: Number of labeled context rows shared by all queries (default: `32`).
+- `--context_size`: Number of labeled context rows shared by all queries (default: `128`).
 - `--context_mode`: Context selection strategy, either `last` or `rnd` (default: `last`).
-- `--num_neighbors`: The number of neighbors to sample for each hop (default: `[8, 8]`).
+- `--num_neighbors`: The number of neighbors to sample for each hop (default: `[4, 4]`).
 - `--batch_size`: Number of query rows predicted together (default: `16`).
-- `--num_lags`: The number of lag targets to use as additional input (default: `0`).
+- `--num_lags`: The number of lag targets to use as additional input (default: `20`).
 
 Attention is dense over all cells of the context and query rows, so the context size, the number of neighbors, and the batch size together bound the number of cells per forward pass; the released checkpoint was pretrained with up to 8,192 cells.
+
+### Results
+
+One shared context per task on a single A100 with the defaults above, about two minutes per task:
+
+| Dataset  | Task              | Test AUROC | Test nMAE |
+| :------- | :---------------- | ---------: | --------: |
+| `rel-f1` | `driver-dnf`      |      81.70 |           |
+| `rel-f1` | `driver-top3`     |      91.20 |           |
+| `rel-f1` | `driver-position` |            |     58.00 |
 
 [^1]: `sentence-transformers/all-MiniLM-L6-v2`
 
