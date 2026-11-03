@@ -188,7 +188,7 @@ class Cells(_Cells, DeviceMixin):
 
         # Target positions first, in order; padding positions follow.
         num_targets = int(is_target.sum(-1).max())
-        target = (~is_target).to(torch.int8).argsort(-1, stable=True)
+        target = (~is_target).to(torch.int8).argsort(stable=True, dim=-1)
         target = target[:, :num_targets]
 
         return cls(
