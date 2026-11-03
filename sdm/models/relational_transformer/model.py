@@ -90,7 +90,7 @@ class RelationalTransformer(ICLModel):
     The reference evaluation protocol builds one context per query row with
     the sampler of the ``relational-transformer`` package. Such contexts enter
     the model through :meth:`predict_cells` after conversion with
-    :meth:`Cells.from_rt_batch`.
+    :meth:`~sdm.models.relational_transformer.Cells.from_rt_batch`.
 
     Classification is restricted to two classes: the model predicts the
     standardized class code and returns the logits ``[0, z]`` over the two
@@ -229,7 +229,7 @@ class RelationalTransformer(ICLModel):
         This is the entry point for contexts built outside the
         :class:`~sdm.tensor.TableTensor` interface, such as the per-query
         contexts of the ``relational-transformer`` sampler converted with
-        :meth:`Cells.from_rt_batch`.
+        :meth:`~sdm.models.relational_transformer.Cells.from_rt_batch`.
 
         Args:
             cells: The cells with shape ``[B, S]`` and ``R`` target cells per

@@ -3,9 +3,11 @@
 
 """Relational Transformer."""
 
+from sdm.models.relational_transformer.cells import Cells
 from sdm.models.relational_transformer.model import RelationalTransformer
 
 
 __all__ = [
+    "Cells",
     "RelationalTransformer",
 ]
