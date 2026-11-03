@@ -165,8 +165,9 @@ class Cells(_Cells, DeviceMixin):
                 ``node_idxs``, ``f2p_nbr_idxs``, ``col_name_idxs``,
                 ``col_name_values``, ``sem_types``, ``number_values``,
                 ``text_values``, ``datetime_values``, ``is_targets`` and
-                ``is_padding`` entries of shape ``[B, S, ...]``, with the same
-                number of target cells in every sequence.
+                ``is_padding`` entries of shape ``[B, S, ...]``. Sequences
+                with fewer target cells than the longest one are padded with
+                arbitrary positions.
         """
         is_padding = batch["is_padding"].bool()
         node = batch["node_idxs"].long().masked_fill(is_padding, -1)
@@ -185,6 +186,11 @@ class Cells(_Cells, DeviceMixin):
         embedding[num_columns:] = batch["text_values"].flatten(0, 1)
         text = torch.arange(B * S, device=node.device).view(B, S) + num_columns
 
+        # Target positions first, in order; padding positions follow.
+        num_targets = int(is_target.sum(-1).max())
+        target = (~is_target).to(torch.int8).argsort(-1, stable=True)
+        target = target[:, :num_targets]
+
         return cls(
             node=node,
             parents=batch["f2p_nbr_idxs"].long(),
@@ -197,7 +203,7 @@ class Cells(_Cells, DeviceMixin):
             ),
             text=text.masked_fill(kind != TEXT, -1),
             is_target=is_target,
-            target=is_target.nonzero()[:, 1].view(B, -1),
+            target=target,
             embedding=embedding,
             num_rows=int(node.max()) + 1,
         )

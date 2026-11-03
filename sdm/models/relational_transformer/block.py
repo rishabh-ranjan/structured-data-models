@@ -93,6 +93,8 @@ def _block_mask(mask: Tensor) -> BlockMask:  # [B, S, S]
     def mask_mod(b: Tensor, h: Tensor, q: Tensor, kv: Tensor) -> Tensor:
         return mask[b, q, kv]
 
+    # The dense mask is already materialized, so the block layout is read off
+    # it directly instead of compiling the mask function per shape.
     return create_block_mask(
         mask_mod,
         B=mask.size(0),
@@ -100,14 +102,15 @@ def _block_mask(mask: Tensor) -> BlockMask:  # [B, S, S]
         Q_LEN=mask.size(1),
         KV_LEN=mask.size(2),
         device=mask.device,
-        _compile=True,
     )
 
 
 @cache
 def _compiled_flex_attention() -> Callable[..., Tensor]:
+    # Static shapes compile once per context size; a second size switches to
+    # dynamic shapes instead of recompiling for every new size.
     return torch.compile(  # ty: ignore[no-matching-overload]
-        flex_attention, dynamic=False
+        flex_attention, dynamic=None
     )
 
 

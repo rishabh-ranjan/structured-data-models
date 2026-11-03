@@ -567,7 +567,9 @@ def _rt_batch(
     kind = torch.randint(0, 3, (B, S), generator=generator)
     is_target = torch.zeros(B, S, dtype=torch.bool)
     is_target[:, 0] = True
+    is_target[0, 3] = True  # Unequal numbers of targets per sequence.
     kind[:, 0] = NUMBER
+    kind[0, 3] = NUMBER
     is_padding = torch.zeros(B, S, dtype=torch.bool)
     is_padding[:, -2:] = True
     column_values = torch.randn(3, D, generator=generator)
@@ -595,8 +597,9 @@ def test_from_rt_batch(device: torch.device) -> None:
     assert cells.node.size() == (B, S)
     assert (cells.node[:, -2:] == -1).all()
     assert cells.parents.size() == (B, S, 5)
-    assert cells.target.tolist() == [[0], [0]]
-    assert cells.is_target.sum() == B
+    assert cells.target[:, 0].tolist() == [0, 0]
+    assert cells.target[0, 1] == 3
+    assert cells.is_target.sum() == B + 1
     text = cells.kind == TEXT
     assert (cells.text[text] >= 0).all()
     assert (cells.text[~text] == -1).all()
@@ -626,7 +629,7 @@ def test_predict_cells(
 ) -> None:
     cells = Cells.from_rt_batch(_rt_batch(2, 11, TEXT_CHANNELS, device))
     out = model.predict_cells(cells, block_sparse=False)
-    assert out.size() == (2, 1)
+    assert out.size() == (2, 2)
     assert out.isfinite().all()
     assert torch.is_inference(out)
 
