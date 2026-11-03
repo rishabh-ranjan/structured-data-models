@@ -34,7 +34,7 @@ from sdm.models.relational_transformer.ckpt import remap_ckpt
 from sdm.models.relational_transformer.recipe import decode_categories
 from sdm.testing import onlyCUDA, withCUDA
 
-CHANNELS = 32
+CHANNELS = 64  # Flex attention requires at least 16 channels per head.
 TEXT_CHANNELS = 16
 
 
@@ -274,8 +274,12 @@ def _upstream_state(overrides: dict[str, Tensor]) -> dict[str, Tensor]:
             state[f"blocks.0.attns.{attn}.{key}.weight"] = torch.randn(
                 channels, channels
             )
-        state[f"blocks.0.attns.{attn}.q_norm.scale"] = torch.rand(8)
-        state[f"blocks.0.attns.{attn}.k_norm.scale"] = torch.rand(8)
+        state[f"blocks.0.attns.{attn}.q_norm.scale"] = torch.rand(
+            channels // 4
+        )
+        state[f"blocks.0.attns.{attn}.k_norm.scale"] = torch.rand(
+            channels // 4
+        )
         state[f"blocks.0.attns.{attn}.scale"] = torch.rand(1, 4, 1, 1)
         state[f"blocks.0.norms.{attn}.scale"] = torch.rand(channels)
     state["blocks.0.norms.ffn.scale"] = torch.rand(channels)
