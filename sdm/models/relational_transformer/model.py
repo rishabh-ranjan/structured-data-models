@@ -33,6 +33,7 @@ from sdm import (
     TableTensor,
     TaskLike,
 )
+from sdm._inference import inference_mode
 from sdm.cache import Cache
 from sdm.models._huggingface import download_checkpoint
 from sdm.models.base import ICLModel
@@ -81,9 +82,15 @@ class RelationalTransformer(ICLModel):
     Related tables are read as foreign keys from the left to the right table
     of each :class:`~sdm.Relationship`, and task links attach task rows to
     their entity rows. Context and query related tables form separate row
-    sets. Attention is dense over all cells of a context, so keep contexts
-    within a few thousand cells; the released checkpoints were pretrained with
-    up to 8,192 cells.
+    sets. On CUDA, attention runs block-sparse through
+    :func:`torch.nn.attention.flex_attention.flex_attention` over cells
+    ordered by column, as in the reference implementation; the released
+    checkpoints were pretrained with contexts of up to 8,192 cells.
+
+    The reference evaluation protocol builds one context per query row with
+    the sampler of the ``relational-transformer`` package. Such contexts enter
+    the model through :meth:`predict_cells` after conversion with
+    :meth:`Cells.from_rt_batch`.
 
     Classification is restricted to two classes: the model predicts the
     standardized class code and returns the logits ``[0, z]`` over the two
@@ -170,6 +177,9 @@ class RelationalTransformer(ICLModel):
     Additional Forward Parameters:
         table_name (str): The name of the task table in column descriptions.
             (default: ``"task"``)
+        block_sparse (bool | None): Whether to run block-sparse flex
+            attention. If ``None``, flex attention is used on CUDA and dense
+            attention otherwise. (default: ``None``)
     """
 
     supported_feature_stypes: ClassVar[frozenset[Stype]] = frozenset(
@@ -207,6 +217,32 @@ class RelationalTransformer(ICLModel):
     def default_recipe(cls) -> Recipe:
         r""":meta private:"""  # noqa: D415
         return default_recipe()
+
+    def predict_cells(
+        self,
+        cells: Cells,  # [B, S]
+        *,
+        block_sparse: bool | None = None,
+    ) -> Tensor:  # [B, R]
+        r"""Predict the masked target cells of tokenized contexts.
+
+        This is the entry point for contexts built outside the
+        :class:`~sdm.tensor.TableTensor` interface, such as the per-query
+        contexts of the ``relational-transformer`` sampler converted with
+        :meth:`Cells.from_rt_batch`.
+
+        Args:
+            cells: The cells with shape ``[B, S]`` and ``R`` target cells per
+                sequence.
+            block_sparse: Whether to run block-sparse flex attention. If
+                ``None``, flex attention is used on CUDA and dense attention
+                otherwise.
+
+        Returns:
+            The standardized target predictions with shape ``[B, R]``.
+        """
+        with inference_mode("none" if self.training else "inference"):
+            return self.model(cells, block_sparse=block_sparse)
 
     def _load_from_pretrained(
         self,
@@ -331,7 +367,10 @@ class RelationalTransformer(ICLModel):
                     vocabulary=vocabulary,
                 )
                 members.append(context.cat(query))
-            out = self.model(Cells.stack(members))  # [E, R_query]
+            out = self.model(
+                Cells.stack(members),
+                block_sparse=cast(bool | None, kwargs.get("block_sparse")),
+            )  # [E, R_query]
             out = out.view(*batch_shape, out.size(-1))
 
         if classes is None:
@@ -394,28 +433,57 @@ class _RelationalTransformer(torch.nn.Module):
         self.norm = RMSNorm(channels, eps=1e-6, **factory_kwargs)
         self.head = Linear(channels, 1, **factory_kwargs)
 
-    def forward(self, cells: Cells) -> Tensor:  # [..., R]
-        valid = (cells.node >= 0).unsqueeze(-1)  # [..., S, 1]
-        is_target = cells.is_target.unsqueeze(-1)  # [..., S, 1]
+    def forward(
+        self,
+        cells: Cells,  # [B, S]
+        *,
+        block_sparse: bool | None = None,
+    ) -> Tensor:  # [B, R]
+        if block_sparse is None:
+            block_sparse = cells.node.is_cuda
 
-        x = self.encoders["column"](cells.embedding[cells.column])
-        for index, kind in enumerate(KINDS):
+        # Order cells by column so that column attention is block-local.
+        pad = cells.node < 0
+        perm = cells.column.masked_fill(pad, torch.iinfo(torch.long).max)
+        perm = perm.argsort(dim=-1, stable=True)  # [B, S]
+        inverse = torch.empty_like(perm).scatter_(
+            -1,
+            perm,
+            torch.arange(perm.size(-1), device=perm.device).expand_as(perm),
+        )
+        node = cells.node.gather(-1, perm)
+        parents = cells.parents.gather(
+            -2, perm.unsqueeze(-1).expand_as(cells.parents)
+        )
+        column = cells.column.gather(-1, perm)
+        kind = cells.kind.gather(-1, perm)
+        value = cells.value.gather(-1, perm)
+        text = cells.text.gather(-1, perm)
+        is_target = cells.is_target.gather(-1, perm).unsqueeze(-1)  # [B, S, 1]
+        target = inverse.gather(-1, cells.target)  # [B, R]
+
+        dtype = self.head.weight.dtype
+        embedding = cells.embedding.to(dtype)
+        x = self.encoders["column"](embedding[column])
+        for index, name in enumerate(KINDS):
             if index == TEXT:
-                inputs = cells.embedding[cells.text.clamp(min=0)]
+                inputs = embedding[text.clamp(min=0)]
             else:
-                inputs = cells.value.unsqueeze(-1)
-            is_kind = (cells.kind == index).unsqueeze(-1)
-            x = x + self.encoders[kind](inputs) * (is_kind & ~is_target)
-            x = x + self.mask_embeddings[kind] * (is_kind & is_target)
-        x = x * valid  # [..., S, C]
+                inputs = value.unsqueeze(-1).to(dtype)
+            is_kind = (kind == index).unsqueeze(-1)
+            x = x + self.encoders[name](inputs) * (is_kind & ~is_target)
+            x = x + self.mask_embeddings[name] * (is_kind & is_target)
+        x = x * ~pad.gather(-1, perm).unsqueeze(-1)  # [B, S, C]
 
-        attn_masks = attention_masks(cells.node, cells.parents, cells.column)
+        attn_masks = attention_masks(
+            node, parents, column, block_sparse=block_sparse
+        )
         for block in self.blocks:
             x = block(x, attn_masks)
         x = self.norm(x)
 
-        out = self.head(x).squeeze(-1)  # [..., S]
-        return out.gather(-1, cells.target)  # [..., R]
+        out = self.head(x).squeeze(-1)  # [B, S]
+        return out.gather(-1, target)  # [B, R]
 
 
 def _members(x: TableTensor) -> list[TableTensor]:

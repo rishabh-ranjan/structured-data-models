@@ -156,6 +156,52 @@ class Cells(_Cells, DeviceMixin):
             num_rows=max(member.num_rows for member in members),
         )
 
+    @classmethod
+    def from_rt_batch(cls, batch: Mapping[str, Tensor]) -> Cells:
+        r"""Create cells from a ``relational-transformer`` sampler batch.
+
+        Args:
+            batch: A batch as returned by ``rt.data.process_batch`` with
+                ``node_idxs``, ``f2p_nbr_idxs``, ``col_name_idxs``,
+                ``col_name_values``, ``sem_types``, ``number_values``,
+                ``text_values``, ``datetime_values``, ``is_targets`` and
+                ``is_padding`` entries of shape ``[B, S, ...]``, with the same
+                number of target cells in every sequence.
+        """
+        is_padding = batch["is_padding"].bool()
+        node = batch["node_idxs"].long().masked_fill(is_padding, -1)
+        column = batch["col_name_idxs"].long()
+        kind = batch["sem_types"].long()
+        is_target = batch["is_targets"].bool()
+        B, S = node.size()
+
+        # One embedding row per column, then one per cell for text values.
+        column_values = batch["col_name_values"]  # [B, S, D]
+        num_columns = int(column.max()) + 1
+        embedding = column_values.new_zeros(
+            (num_columns + B * S, column_values.size(-1))
+        )
+        embedding[column.flatten()] = column_values.flatten(0, 1)
+        embedding[num_columns:] = batch["text_values"].flatten(0, 1)
+        text = torch.arange(B * S, device=node.device).view(B, S) + num_columns
+
+        return cls(
+            node=node,
+            parents=batch["f2p_nbr_idxs"].long(),
+            column=column,
+            kind=kind,
+            value=torch.where(
+                kind == DATETIME,
+                batch["datetime_values"].squeeze(-1),
+                batch["number_values"].squeeze(-1),
+            ),
+            text=text.masked_fill(kind != TEXT, -1),
+            is_target=is_target,
+            target=is_target.nonzero()[:, 1].view(B, -1),
+            embedding=embedding,
+            num_rows=int(node.max()) + 1,
+        )
+
 
 def _pad(
     tensor: Tensor,

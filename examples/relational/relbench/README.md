@@ -54,11 +54,30 @@ Optimal hyperparameters found via the [RelArena-α](../../../benchmark/relationa
 
 ### Run
 
+`relational_transformer.py` reproduces the released RT-J protocol with the sampler of the [`relational-transformer`](https://github.com/stanford-star/relational-transformer) package (`pip install relational-transformer`): one context of up to 8,192 cells per query row, sampled from the preprocessed RelBench databases on the Hugging Face Hub, scored with the RelBench metrics.
+
 ```bash
 python relational_transformer.py --dataset=rel-f1 --task=driver-dnf
 ```
 
+`relational_transformer_sdm_sampler.py` runs the same model through the `TableTensor` interface with the `structured-data-models` sampler instead, sharing one labeled context across all query rows:
+
+```bash
+python relational_transformer_sdm_sampler.py --dataset=rel-f1 --task=driver-dnf
+```
+
 ### Options
+
+`relational_transformer.py`:
+
+- `--checkpoint`: The pretrained checkpoint, either `rt-j` or `rt-plurel` (default: `rt-j`).
+- `--ctx_size`: Number of cells per context (default: `8192`).
+- `--local_ctx_size`: Number of cells sampled around each seed row (default: `256`).
+- `--bfs_width`: Number of rows kept per breadth-first search level (default: `32`).
+- `--tokens_per_gpu`: Number of cells per forward pass, which sets the batch size (default: `65536`).
+- `--context_seed`: Seed of the context sampler (default: `0`).
+
+`relational_transformer_sdm_sampler.py`:
 
 - `--context_size`: Number of labeled context rows shared by all queries (default: `128`).
 - `--context_mode`: Context selection strategy, either `last` or `rnd` (default: `last`).
@@ -66,17 +85,9 @@ python relational_transformer.py --dataset=rel-f1 --task=driver-dnf
 - `--batch_size`: Number of query rows predicted together (default: `16`).
 - `--num_lags`: The number of lag targets to use as additional input (default: `20`).
 
-Attention is dense over all cells of the context and query rows, so the context size, the number of neighbors, and the batch size together bound the number of cells per forward pass; the released checkpoint was pretrained with up to 8,192 cells.
-
 ### Results
 
-One shared context per task on a single A100 with the defaults above, about two minutes per task:
-
-| Dataset  | Task              | Test AUROC | Test nMAE |
-| :------- | :---------------- | ---------: | --------: |
-| `rel-f1` | `driver-dnf`      |      81.70 |           |
-| `rel-f1` | `driver-top3`     |      91.20 |           |
-| `rel-f1` | `driver-position` |            |     58.00 |
+RESULTS_RT_PROTOCOL
 
 [^1]: `sentence-transformers/all-MiniLM-L6-v2`
 

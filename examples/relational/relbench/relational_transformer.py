@@ -1,157 +1,112 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import argparse
-from typing import Any, cast
+"""RelationalTransformer on RelBench with the Relational Transformer sampler.
 
-import pandas as pd
-import relbench
+Reproduces the released RT-J evaluation protocol: one context of up to 8,192
+cells per query row, sampled by the `relational-transformer` package from the
+preprocessed RelBench databases, and scored with the RelBench metrics.
+"""
+
+import argparse
+from collections.abc import Mapping, Sequence
+
 import torch
-import torchmetrics
-from lag_target import add_lag_target
-from tqdm import tqdm
+from huggingface_hub import snapshot_download
+from rt.data import get_tasks
+from rt.eval import build_evaluator, run_and_report
+from torch import Tensor
 
 import sdm
+from sdm.models.relational_transformer import Cells
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--dataset", type=str, required=True)
 parser.add_argument("--task", type=str, required=True)
-parser.add_argument("--context_size", type=int, default=128)
-parser.add_argument("--context_mode", choices=("last", "rnd"), default="last")
-parser.add_argument("--batch_size", type=int, default=16)
-parser.add_argument("--max_test_steps", type=int, default=None)
-parser.add_argument("--num_neighbors", type=int, nargs="*", default=[4, 4])
-parser.add_argument("--num_lags", type=int, default=20)
-parser.add_argument("--seed", type=int, default=0)
+parser.add_argument(
+    "--checkpoint", choices=("rt-j", "rt-plurel"), default="rt-j"
+)
+parser.add_argument("--ctx_size", type=int, default=8192)
+parser.add_argument("--local_ctx_size", type=int, default=256)
+parser.add_argument("--bfs_width", type=int, default=32)
+parser.add_argument("--tokens_per_gpu", type=int, default=2**16)
+parser.add_argument("--max_items", type=int, default=10_000_000)
+parser.add_argument("--num_workers", type=int, default=2)
+parser.add_argument("--context_seed", type=int, default=0)
 args = parser.parse_args()
 
-torch.manual_seed(args.seed)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Collect Relational Data #####################################################
-dataset = relbench.load_dataset(args.dataset)
-task = dataset.load_task(args.task)
-db = task.get_db(upto_test_timestamp=False)
-data = sdm.RelationalData(
-    tables={
-        name: sdm.TableTensor.from_pandas(
-            df=table.df,
-            stypes=sdm.infer_stypes(
-                table.df.head(10_000),
-                overrides={
-                    cast(str, table.pkey_col): "id",
-                    **dict.fromkeys(table.fkey_col_to_pkey_table, "id"),
-                },
-                text="infer",
-                unsupported="drop",
-            ),
-        )
-        for name, table in db.table_dict.items()
-    },
-    relationships=[
-        {
-            "left_table": left_table,
-            "left_column": left_column,
-            "right_table": right_table,
-            "right_column": cast(str, db.table_dict[right_table].pkey_col),
-        }
-        for left_table, table in db.table_dict.items()
-        for left_column, right_table in table.fkey_col_to_pkey_table.items()
-    ],
+# Preprocessed database and task #############################################
+pre_dir = snapshot_download(
+    "stanford-star/relbench-preprocessed",
+    repo_type="dataset",
+    allow_patterns=f"{args.dataset}/*",
+    revision="1016626ddb30c027b92458bf866903850cc205e1",
+)
+tasks = get_tasks(pre_dir, [(args.dataset, args.task)], ("test",))
+evaluator = build_evaluator(
+    tasks,
+    pre_dir,
+    embedder="all-MiniLM-L12-v2",
+    d_text=384,
+    device=str(device),
+    ctx_size_list=[args.ctx_size],
+    local_ctx_size=args.local_ctx_size,
+    bfs_width=args.bfs_width,
+    prefer_latest=True,
+    num_walks=10_000,
+    walk_length=20,
+    tokens_per_gpu=args.tokens_per_gpu,
+    items_per_task=args.max_items,
+    num_workers=args.num_workers,
+    prefetch_factor=2,
+    shuffle_seed=0,
+    context_seed=args.context_seed,
+    mmap_populate=True,
+    vector_db_path=None,
+    db_cutoff=None,
 )
 
-# Collect Task Table ##########################################################
-if task.task_type not in {
-    relbench.base.TaskType.BINARY_CLASSIFICATION,
-    relbench.base.TaskType.REGRESSION,
-}:
-    quit(f"Unsupported task {task.task_type.value!r}")
 
-dfs = [
-    task.get_table(split, mask_input_cols=False).df
-    for split in ["train", "val", "test"]
-]
-df = pd.concat(dfs, ignore_index=True)
-df = add_lag_target(df, task, args.num_lags)
+# Model #######################################################################
+class Net(torch.nn.Module):
+    """Adapt the model to the predictor interface of the RT evaluator."""
 
-if task.task_type == relbench.base.TaskType.REGRESSION:
-    target_stype = "numerical"
-else:
-    target_stype = "categorical"
+    def __init__(self, model: sdm.models.RelationalTransformer) -> None:
+        super().__init__()
+        self.model = model
 
-task_table = sdm.TableTensor.from_pandas(
-    df=df,
-    stypes={
-        task.entity_col: "id",
-        task.time_col: "datetime",
-        task.target_col: target_stype,
-        **{
-            f"{task.target_col}_lag_{lag}": target_stype
-            for lag in range(1, args.num_lags + 1)
-        },
-    },
+    def predict(
+        self,
+        batch: Mapping[str, Tensor],
+        ctx_size_list: Sequence[int],
+        device: torch.device | str,
+        task: object,
+    ) -> dict[int, Tensor]:
+        preds = {}
+        for ctx_size in ctx_size_list:
+            cells = Cells.from_rt_batch(
+                {
+                    key: value[:, :ctx_size].to(device, non_blocking=True)
+                    for key, value in batch.items()
+                }
+            )
+            preds[ctx_size] = self.model.predict_cells(cells)[:, 0].cpu()
+        return preds
+
+
+model = sdm.models.RelationalTransformer(
+    checkpoint=args.checkpoint,
+    device=device,
+).to(torch.bfloat16)
+
+run_and_report(
+    Net(model),
+    tasks,
+    pre_dir,
+    ctx_size=args.ctx_size,
+    csv_out_dir=None,
+    evaluator=evaluator,
+    embedder="all-MiniLM-L12-v2",
 )
-
-context, query = task_table.split([len(dfs[0]) + len(dfs[1]), len(dfs[2])])
-if len(context) > args.context_size:
-    if args.context_mode == "last":
-        order = context.datetime.reshape(-1).argsort(descending=True)
-    else:
-        order = torch.randperm(len(context))
-    context = context[order[: args.context_size]]
-
-# Create Subgraph Sampler #####################################################
-sampler = data.sampler(
-    time_columns={
-        name: table.time_col
-        for name, table in db.table_dict.items()
-        if table.time_col is not None
-    },
-)
-kwargs: dict[str, Any] = {
-    "task_link": {
-        "task_column": task.entity_col,
-        "table": task.entity_table,
-        "table_column": cast(str, db.table_dict[task.entity_table].pkey_col),
-    },
-    "num_neighbors": args.num_neighbors,
-    "task_time_column": task.time_col,
-}
-
-# Execute Model ###############################################################
-model = sdm.models.RelationalTransformer(device=device)
-
-context, related_tables = sampler(context, **kwargs).to(device)
-with torch.amp.autocast(device.type, torch.bfloat16, enabled=True):
-    model.fit(
-        x=context.drop_columns(task.target_col),
-        y=context[task.target_col],
-        related_tables=related_tables,
-        table_name=args.task,
-    )
-
-if task.task_type == relbench.base.TaskType.REGRESSION:
-    metric = torchmetrics.regression.MeanAbsoluteError()
-else:
-    metric = torchmetrics.classification.BinaryAUROC()
-    positive_class = dfs[0][task.target_col].unique()[-1].item()
-metric = metric.to(device)
-for batch in tqdm(query.split(args.batch_size, -2)[: args.max_test_steps]):
-    x_query = batch.drop_columns(task.target_col)
-    y_query = batch[task.target_col].to(device)
-    with torch.amp.autocast(device.type, torch.bfloat16, enabled=True):
-        out = model.predict(*sampler(x_query, **kwargs).to(device))
-
-    if task.task_type == relbench.base.TaskType.REGRESSION:
-        pred = out["pred"].numerical.squeeze(-1)
-        target = y_query.numerical.squeeze(-1)
-    else:
-        pred, target = sdm.evaluation.to_binary_class(
-            out, y_query, positive_class
-        )
-    metric.update(pred, target)
-
-if task.task_type == relbench.base.TaskType.REGRESSION:
-    print(f"nMAE: {100 * metric.compute() / task.nmae_std:.2f}")
-else:
-    print(f"AUROC: {100 * metric.compute():.2f}")

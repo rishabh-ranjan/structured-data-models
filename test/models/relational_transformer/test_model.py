@@ -19,6 +19,7 @@ from sdm import (
 from sdm.models import RelationalTransformer
 from sdm.models.relational_transformer import model as rt_module
 from sdm.models.relational_transformer.block import (
+    AttentionMask,
     RelationalBlock,
     attention_masks,
 )
@@ -31,7 +32,7 @@ from sdm.models.relational_transformer.cells import (
 )
 from sdm.models.relational_transformer.ckpt import remap_ckpt
 from sdm.models.relational_transformer.recipe import decode_categories
-from sdm.testing import withCUDA
+from sdm.testing import onlyCUDA, withCUDA
 
 CHANNELS = 32
 TEXT_CHANNELS = 16
@@ -116,11 +117,11 @@ def related_tables(
 
 def test_attention_masks() -> None:
     # Rows: 0 and 1 reference row 2; row 3 is a padding cell.
-    node = torch.tensor([0, 0, 1, 2, -1])
-    parents = torch.tensor([[2], [2], [2], [-1], [-1]])
-    column = torch.tensor([0, 1, 0, 1, 0])
+    node = torch.tensor([[0, 0, 1, 2, -1]])
+    parents = torch.tensor([[[2], [2], [2], [-1], [-1]]])
+    column = torch.tensor([[0, 1, 0, 1, 0]])
 
-    masks = attention_masks(node, parents, column)
+    masks = attention_masks(node, parents, column, block_sparse=False)
 
     expected = {
         "column": [
@@ -146,8 +147,10 @@ def test_attention_masks() -> None:
         ],
     }
     for name, value in expected.items():
-        assert masks[name].size() == (1, 5, 5)
-        assert masks[name][0].equal(torch.tensor(value, dtype=torch.bool))
+        assert masks[name].mask.size() == (1, 5, 5)
+        assert masks[name].mask[0].equal(torch.tensor(value, dtype=torch.bool))
+        assert masks[name].key_len[0].tolist() == [sum(row) for row in value]
+        assert masks[name].block_mask is None
 
 
 @withCUDA
@@ -163,14 +166,24 @@ def test_block_skips_attention_without_keys(device: torch.device) -> None:
             torch.nn.init.normal_(parameter, std=0.02)
 
     S = 6
-    x = torch.randn(S, CHANNELS, device=device)
+    x = torch.randn(1, S, CHANNELS, device=device)
     full = torch.ones(1, S, S, dtype=torch.bool, device=device)
     none = torch.zeros(1, S, S, dtype=torch.bool, device=device)
-    out = block(x, {"column": full, "feature": full, "neighbor": none})
+    masks = {
+        name: AttentionMask(mask=mask, key_len=mask.sum(-1), block_mask=None)
+        for name, mask in (
+            ("column", full),
+            ("feature", full),
+            ("neighbor", none),
+        )
+    }
+    out = block(x, masks)
 
     expected = x
     for name in ("column", "feature"):
-        expected = expected + block.attns[name](block.norms[name](expected))
+        expected = expected + block.attns[name](
+            block.norms[name](expected), masks[name]
+        )
     expected = expected + block.mlp(block.norms["mlp"](expected))
     torch.testing.assert_close(out, expected)
 
@@ -231,10 +244,8 @@ def test_attention_matches_upstream_formulation() -> None:
     }
     block.attns["column"].load_state_dict(state)
 
-    torch.testing.assert_close(
-        block.attns["column"](x, attn_mask=mask.unsqueeze(1)),
-        expected,
-    )
+    attn_mask = AttentionMask(mask=mask, key_len=mask.sum(-1), block_mask=None)
+    torch.testing.assert_close(block.attns["column"](x, attn_mask), expected)
 
 
 def _upstream_state(overrides: dict[str, Tensor]) -> dict[str, Tensor]:
@@ -520,3 +531,120 @@ def test_missing_values_are_dropped(model: RelationalTransformer) -> None:
     with_nan[4, 0] = torch.nan
     assert not model(with_nan, y_context, x_query).numerical.isnan().any()
     assert not model(with_nan, y_context, x_query).allclose(out)
+
+
+def test_cell_order_does_not_change_predictions(
+    model: RelationalTransformer,
+) -> None:
+    x_context = torch.randn(6, 4)
+    y_context = torch.randn(6, 1)
+    x_query = torch.randn(2, 4)
+    out = model(x_context, y_context, x_query)
+    # Reordering columns changes the cell order but not the prediction.
+    perm = [2, 0, 3, 1]
+    columns = [str(i) for i in perm]
+    x_context_perm = TableTensor.from_tensor(x_context[:, perm], columns)
+    x_query_perm = TableTensor.from_tensor(x_query[:, perm], columns)
+    torch.testing.assert_close(
+        model(x_context_perm, y_context, x_query_perm).numerical,
+        out.numerical,
+        atol=1e-5,
+        rtol=1e-4,
+    )
+
+
+def _rt_batch(
+    B: int, S: int, D: int, device: torch.device
+) -> dict[str, Tensor]:
+    generator = torch.Generator().manual_seed(0)
+    node = torch.arange(S).div(3, rounding_mode="floor").expand(B, S).clone()
+    parents = torch.full((B, S, 5), -1)
+    parents[..., 0] = (node + 1) % (S // 3)
+    kind = torch.randint(0, 3, (B, S), generator=generator)
+    is_target = torch.zeros(B, S, dtype=torch.bool)
+    is_target[:, 0] = True
+    kind[:, 0] = NUMBER
+    is_padding = torch.zeros(B, S, dtype=torch.bool)
+    is_padding[:, -2:] = True
+    column_values = torch.randn(3, D, generator=generator)
+    batch = {
+        "node_idxs": node.to(torch.int32),
+        "f2p_nbr_idxs": parents.to(torch.int32),
+        "col_name_idxs": (torch.arange(S) % 3).expand(B, S).to(torch.int32),
+        "col_name_values": column_values[torch.arange(S) % 3].expand(B, S, D),
+        "sem_types": kind.to(torch.int32),
+        "number_values": torch.randn(B, S, 1, generator=generator),
+        "text_values": torch.randn(B, S, D, generator=generator),
+        "datetime_values": torch.randn(B, S, 1, generator=generator),
+        "is_targets": is_target,
+        "is_padding": is_padding,
+    }
+    return {key: value.to(device) for key, value in batch.items()}
+
+
+@withCUDA
+def test_from_rt_batch(device: torch.device) -> None:
+    B, S, D = 2, 11, TEXT_CHANNELS
+    batch = _rt_batch(B, S, D, device)
+    cells = Cells.from_rt_batch(batch)
+
+    assert cells.node.size() == (B, S)
+    assert (cells.node[:, -2:] == -1).all()
+    assert cells.parents.size() == (B, S, 5)
+    assert cells.target.tolist() == [[0], [0]]
+    assert cells.is_target.sum() == B
+    text = cells.kind == TEXT
+    assert (cells.text[text] >= 0).all()
+    assert (cells.text[~text] == -1).all()
+    torch.testing.assert_close(
+        cells.embedding[cells.column],
+        batch["col_name_values"],
+    )
+    torch.testing.assert_close(
+        cells.embedding[cells.text[text]],
+        batch["text_values"][text],
+    )
+    datetime = cells.kind == DATETIME
+    torch.testing.assert_close(
+        cells.value[datetime],
+        batch["datetime_values"].squeeze(-1)[datetime],
+    )
+    torch.testing.assert_close(
+        cells.value[~datetime],
+        batch["number_values"].squeeze(-1)[~datetime],
+    )
+
+
+@withCUDA
+def test_predict_cells(
+    model: RelationalTransformer,
+    device: torch.device,
+) -> None:
+    cells = Cells.from_rt_batch(_rt_batch(2, 11, TEXT_CHANNELS, device))
+    out = model.predict_cells(cells, block_sparse=False)
+    assert out.size() == (2, 1)
+    assert out.isfinite().all()
+    assert torch.is_inference(out)
+
+
+@onlyCUDA
+@pytest.mark.usefixtures("compilation")
+def test_block_sparse_attention_matches_dense() -> None:
+    device = torch.device("cuda")
+    core = rt_module._RelationalTransformer(
+        num_layers=2,
+        channels=CHANNELS,
+        text_channels=TEXT_CHANNELS,
+        num_heads=4,
+        hidden_channels=64,
+        device=device,
+    )
+    for parameter in core.parameters():
+        if not parameter.any():
+            torch.nn.init.normal_(parameter, std=0.02)
+    cells = Cells.from_rt_batch(_rt_batch(2, 300, TEXT_CHANNELS, device))
+
+    with torch.inference_mode():
+        dense = core(cells, block_sparse=False)
+        sparse = core(cells, block_sparse=True)
+    torch.testing.assert_close(sparse, dense, atol=1e-4, rtol=1e-3)

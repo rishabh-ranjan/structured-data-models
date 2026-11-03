@@ -7,51 +7,207 @@
 
 # ruff: noqa: D205
 
-from collections.abc import Mapping
-from typing import Any
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping
+from functools import cache
+from typing import Any, NamedTuple
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
-from torch.nn import Linear, ModuleDict, Sequential, Sigmoid
+from torch.nn import Linear, ModuleDict
+from torch.nn.attention.flex_attention import (
+    BlockMask,
+    create_block_mask,
+    flex_attention,
+)
 
-from sdm.nn import Attention, LogScale, RMSNorm, SwiGLU
+from sdm.nn import LogScale, RMSNorm, SwiGLU
 
 ATTENTION_TYPES = ("column", "feature", "neighbor")
 
 
-def attention_masks(
-    node: Tensor,  # [..., S]
-    parents: Tensor,  # [..., S, K]
-    column: Tensor,  # [..., S]
-) -> dict[str, Tensor]:  # [..., 1, S, S]
-    r"""Return the boolean attention masks of a :class:`RelationalBlock`.
+class AttentionMask(NamedTuple):
+    r"""The attention mask of one attention type.
 
     Args:
-        node: The row of each cell with shape ``[..., S]``; ``-1`` marks
+        mask: Boolean mask with shape ``[B, S, S]``; ``True`` lets a query
+            cell attend to a key cell.
+        key_len: The number of attended keys per query with shape ``[B, S]``.
+        block_mask: The block-sparse form of ``mask`` for flex attention, or
+            ``None`` to run dense scaled dot-product attention.
+    """
+
+    mask: Tensor
+    key_len: Tensor
+    block_mask: BlockMask | None
+
+
+def attention_masks(
+    node: Tensor,  # [B, S]
+    parents: Tensor,  # [B, S, K]
+    column: Tensor,  # [B, S]
+    *,
+    block_sparse: bool,
+) -> dict[str, AttentionMask]:
+    r"""Return the attention masks of a :class:`RelationalBlock`.
+
+    Args:
+        node: The row of each cell with shape ``[B, S]``; ``-1`` marks
             padding.
-        parents: The parent rows of each cell's row with shape
-            ``[..., S, K]``, padded with ``-1``.
-        column: The column of each cell with shape ``[..., S]``.
+        parents: The parent rows of each cell's row with shape ``[B, S, K]``,
+            padded with ``-1``.
+        column: The column of each cell with shape ``[B, S]``.
+        block_sparse: Whether to also build block-sparse masks for flex
+            attention.
 
     Returns:
-        Masks with shape ``[..., 1, S, S]`` keyed by attention type, where
-        ``True`` lets a query cell attend to a key cell.
+        Masks keyed by attention type. *Column* attention connects cells of
+        the same column, *feature* attention connects cells of the same row
+        and of its parent rows, and *neighbor* attention connects a cell to
+        the cells of rows that reference its row.
     """
     valid = node >= 0
-    pair = valid.unsqueeze(-1) & valid.unsqueeze(-2)  # [..., S, S]
+    pair = valid.unsqueeze(-1) & valid.unsqueeze(-2)  # [B, S, S]
     same_node = node.unsqueeze(-1) == node.unsqueeze(-2)
     key_in_parents = torch.zeros_like(same_node)
-    for k in range(
-        parents.size(-1)
-    ):  # The key's row is a parent of the query's row.
+    for k in range(parents.size(-1)):  # Key row is a parent of query row.
         key_in_parents |= node.unsqueeze(-2) == parents[..., k].unsqueeze(-1)
-    return {
-        "column": ((column.unsqueeze(-1) == column.unsqueeze(-2)) & pair)[
-            ..., None, :, :
-        ],
-        "feature": ((same_node | key_in_parents) & pair)[..., None, :, :],
-        "neighbor": (key_in_parents.transpose(-1, -2) & pair)[..., None, :, :],
+    masks = {
+        "column": (column.unsqueeze(-1) == column.unsqueeze(-2)) & pair,
+        "feature": (same_node | key_in_parents) & pair,
+        "neighbor": key_in_parents.transpose(-1, -2) & pair,
     }
+    return {
+        name: AttentionMask(
+            mask=mask,
+            key_len=mask.sum(dim=-1),
+            block_mask=_block_mask(mask) if block_sparse else None,
+        )
+        for name, mask in masks.items()
+    }
+
+
+def _block_mask(mask: Tensor) -> BlockMask:  # [B, S, S]
+    def mask_mod(b: Tensor, h: Tensor, q: Tensor, kv: Tensor) -> Tensor:
+        return mask[b, q, kv]
+
+    return create_block_mask(
+        mask_mod,
+        B=mask.size(0),
+        H=None,
+        Q_LEN=mask.size(1),
+        KV_LEN=mask.size(2),
+        device=mask.device,
+        _compile=True,
+    )
+
+
+@cache
+def _compiled_flex_attention() -> Callable[..., Tensor]:
+    return torch.compile(  # ty: ignore[no-matching-overload]
+        flex_attention, dynamic=False
+    )
+
+
+class RelationalAttention(torch.nn.Module):
+    r"""Masked self-attention over cells for one attention type.
+
+    Query and key heads are normalized with :class:`~sdm.nn.RMSNorm`, queries
+    are scaled by :class:`~sdm.nn.LogScale` of the number of attended keys,
+    logits use a ``1 / channels_per_head`` scale, and the attention output is
+    gated by a sigmoid of the input. Block-sparse masks run through
+    :func:`torch.nn.attention.flex_attention.flex_attention`; dense masks run
+    through :func:`torch.nn.functional.scaled_dot_product_attention`. A cell
+    without any key to attend to returns zero.
+
+    Args:
+        channels: The number of input and output channels.
+        num_heads: The number of attention heads.
+        device: The device.
+        dtype: The dtype.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        num_heads: int,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__()
+        factory_kwargs: dict[str, Any] = {"device": device, "dtype": dtype}
+        self.num_heads = num_heads
+        self.head_channels = channels // num_heads
+
+        self.qkv_lin = Linear(
+            channels, 3 * channels, bias=False, **factory_kwargs
+        )
+        self.query_norm = RMSNorm(
+            self.head_channels, eps=1e-6, **factory_kwargs
+        )
+        self.key_norm = RMSNorm(self.head_channels, eps=1e-6, **factory_kwargs)
+        self.query_scaling = LogScale(num_heads, **factory_kwargs)
+        self.gate_lin = Linear(
+            channels, channels, bias=False, **factory_kwargs
+        )
+        self.out_lin = Linear(channels, channels, bias=False, **factory_kwargs)
+
+    def forward(
+        self,
+        x: Tensor,  # [B, S, C]
+        attn_mask: AttentionMask,
+    ) -> Tensor:  # [B, S, C]
+        r"""The forward pass.
+
+        Args:
+            x: The cell embeddings with shape ``[B, S, C]``.
+            attn_mask: The attention mask of this attention type.
+
+        Returns:
+            Tensor with shape ``[B, S, C]``.
+        """
+        query, key, value = (
+            self.qkv_lin(x)
+            .unflatten(-1, (3, self.num_heads, self.head_channels))
+            .unbind(-3)
+        )  # [B, S, H, C // H]
+        query = self.query_scaling(
+            self.query_norm(query),
+            key_len=attn_mask.key_len,
+        )
+        key = self.key_norm(key)
+        query, key, value = (
+            tensor.transpose(1, 2) for tensor in (query, key, value)
+        )  # [B, H, S, C // H]
+
+        if attn_mask.block_mask is not None:
+            out = _compiled_flex_attention()(
+                query,
+                key,
+                value,
+                block_mask=attn_mask.block_mask,
+                scale=1.0 / self.head_channels,
+            )
+        else:
+            # SDPA has no key to normalize over for an empty row: let it attend
+            # to itself and drop the result afterwards.
+            empty = attn_mask.key_len == 0  # [B, S]
+            eye = torch.eye(x.size(1), dtype=torch.bool, device=x.device)
+            out = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=(attn_mask.mask | (empty.unsqueeze(-1) & eye))[
+                    :, None
+                ],
+                scale=1.0 / self.head_channels,
+            )
+            out = out.masked_fill(empty[:, None, :, None], 0.0)
+
+        out = out.transpose(1, 2).flatten(-2)  # [B, S, C]
+        return self.out_lin(out * torch.sigmoid(self.gate_lin(x)))
 
 
 class RelationalBlock(torch.nn.Module):
@@ -59,18 +215,13 @@ class RelationalBlock(torch.nn.Module):
     Zero-Shot Foundation Models for Relational Data"
     <https://arxiv.org/abs/2510.06377>`_ paper.
 
-    Cells pass through three masked self-attention residuals in sequence:
-    *column* attention among cells of the same column, *feature* attention
-    among cells of the same row and of its foreign-key parent rows, and
-    *neighbor* attention from a cell to the cells of rows that reference its
-    row. A :class:`~sdm.nn.SwiGLU` feed-forward residual follows. Every
-    residual is pre-normalized with :class:`~sdm.nn.RMSNorm`.
-
-    Attention normalizes query and key heads, scales queries by
-    :class:`~sdm.nn.LogScale` of the number of attended keys, uses a
-    ``1 / channels_per_head`` logit scale, and gates its output with a sigmoid
-    of the normalized input. A cell without any key to attend to leaves the
-    residual unchanged.
+    Cells pass through three :class:`RelationalAttention` residuals in
+    sequence, over the masks of :func:`attention_masks`: *column*
+    attention among cells of the same column, *feature* attention among cells
+    of the same row and of its foreign-key parent rows, and *neighbor*
+    attention from a cell to the cells of rows that reference its row. A
+    :class:`~sdm.nn.SwiGLU` feed-forward residual follows. Every residual is
+    pre-normalized with :class:`~sdm.nn.RMSNorm`.
 
     Args:
         channels: The number of input and output channels.
@@ -90,7 +241,6 @@ class RelationalBlock(torch.nn.Module):
     ) -> None:
         super().__init__()
         factory_kwargs: dict[str, Any] = {"device": device, "dtype": dtype}
-        head_channels = channels // num_heads
 
         self.norms = ModuleDict(
             {
@@ -100,25 +250,8 @@ class RelationalBlock(torch.nn.Module):
         )
         self.attns = ModuleDict(
             {
-                name: Attention(
-                    channels=channels,
-                    num_query_heads=num_heads,
-                    query_transform=RMSNorm(
-                        head_channels, eps=1e-6, **factory_kwargs
-                    ),
-                    key_transform=RMSNorm(
-                        head_channels, eps=1e-6, **factory_kwargs
-                    ),
-                    query_scaling=LogScale(num_heads, **factory_kwargs),
-                    gate=Sequential(
-                        Linear(
-                            channels, channels, bias=False, **factory_kwargs
-                        ),
-                        Sigmoid(),
-                    ),
-                    scale=1.0 / head_channels,
-                    bias=False,
-                    **factory_kwargs,
+                name: RelationalAttention(
+                    channels, num_heads, **factory_kwargs
                 )
                 for name in ATTENTION_TYPES
             }
@@ -129,27 +262,19 @@ class RelationalBlock(torch.nn.Module):
 
     def forward(
         self,
-        x: Tensor,  # [..., S, C]
-        attn_masks: Mapping[str, Tensor],  # [..., 1, S, S]
-    ) -> Tensor:  # [..., S, C]
+        x: Tensor,  # [B, S, C]
+        attn_masks: Mapping[str, AttentionMask],
+    ) -> Tensor:  # [B, S, C]
         r"""The forward pass.
 
         Args:
-            x: The cell embeddings with shape ``[..., S, C]``.
-            attn_masks: Boolean masks with shape ``[..., 1, S, S]`` keyed by
-                attention type, as returned by :func:`attention_masks`.
+            x: The cell embeddings with shape ``[B, S, C]``.
+            attn_masks: The masks keyed by attention type, as returned by
+                :func:`attention_masks`.
 
         Returns:
-            Tensor with shape ``[..., S, C]``.
+            Tensor with shape ``[B, S, C]``.
         """
-        eye = torch.eye(x.size(-2), dtype=torch.bool, device=x.device)
         for name, attn in self.attns.items():
-            attn_mask = attn_masks[name]
-            # SDPA has no key to normalize over for an empty row: let it attend
-            # to itself and drop the result afterwards.
-            empty = ~attn_mask.any(dim=-1, keepdim=True)  # [..., 1, S, 1]
-            out = attn(
-                self.norms[name](x), attn_mask=attn_mask | (empty & eye)
-            )
-            x = x + out.masked_fill(empty.squeeze(-3), 0.0)
+            x = x + attn(self.norms[name](x), attn_masks[name])
         return x + self.mlp(self.norms["mlp"](x))

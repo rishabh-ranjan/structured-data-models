@@ -40,12 +40,12 @@ def remap_ckpt(ckpt: dict[str, Tensor]) -> dict[str, Tensor]:  # noqa: D103
             # The upstream gate is `2 * sigmoid(.)`; fold the factor into the
             # output projection, which has no bias.
             out[f"{dst}out_lin.weight"] = 2 * ckpt[f"{src}wo.weight"]
-            out[f"{dst}gate.0.weight"] = ckpt[f"{src}wg.weight"]
-            out[f"{dst}query_transform.weight"] = ckpt[f"{src}q_norm.scale"]
-            out[f"{dst}key_transform.weight"] = ckpt[f"{src}k_norm.scale"]
-            out[f"{dst}sdpa.query_scaling.head_scale"] = ckpt[
-                f"{src}scale"
-            ].reshape(-1)
+            out[f"{dst}gate_lin.weight"] = ckpt[f"{src}wg.weight"]
+            out[f"{dst}query_norm.weight"] = ckpt[f"{src}q_norm.scale"]
+            out[f"{dst}key_norm.weight"] = ckpt[f"{src}k_norm.scale"]
+            out[f"{dst}query_scaling.head_scale"] = ckpt[f"{src}scale"].view(
+                -1
+            )
             out[f"blocks.{layer}.norms.{name}.weight"] = ckpt[
                 f"blocks.{layer}.norms.{upstream}.scale"
             ]
