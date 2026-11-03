@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 import torch
 from torch import Tensor
+from torch.nn.attention.flex_attention import create_block_mask
 
 from sdm import (
     CategoricalTensor,
@@ -660,8 +661,6 @@ def test_block_sparse_attention_matches_dense() -> None:
 
 @pytest.mark.parametrize("size", [5, 128, 300])
 def test_block_mask_matches_torch(size: int) -> None:
-    from torch.nn.attention.flex_attention import create_block_mask
-
     generator = torch.Generator().manual_seed(0)
     mask = torch.rand(2, size, size, generator=generator) < 0.3
     mask[:, : size // 2, : size // 2] = True

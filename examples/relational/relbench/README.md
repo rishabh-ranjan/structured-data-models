@@ -87,7 +87,15 @@ python relational_transformer_sdm_sampler.py --dataset=rel-f1 --task=driver-dnf
 
 ### Results
 
-RESULTS_RT_PROTOCOL
+`relational_transformer.py` with RT-J, 8,192 cells per query and one context seed, on one A100 (about 40 seconds of prediction per task; the RT-J quickstart reports 0.826 AUROC on `driver-dnf` with the same settings):
+
+| Dataset  | Task              | Test AUROC | Test nMAE |
+| :------- | :---------------- | ---------: | --------: |
+| `rel-f1` | `driver-dnf`      |      82.79 |           |
+| `rel-f1` | `driver-top3`     |      90.90 |           |
+| `rel-f1` | `driver-position` |            |     38.56 |
+
+`relational_transformer_sdm_sampler.py` with the defaults above shares one context of 128 labeled rows across all queries and reaches 81.70 AUROC on `driver-dnf`; the published RT-J results depend on its own per-query sampler.
 
 [^1]: `sentence-transformers/all-MiniLM-L6-v2`
 
